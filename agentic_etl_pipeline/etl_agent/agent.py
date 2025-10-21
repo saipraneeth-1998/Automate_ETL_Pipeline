@@ -1,165 +1,211 @@
-import boto3
-import os
 import json
+import boto3
+from datetime import datetime
 import time
-from botocore.exceptions import ClientError
+import math
 
-# -------------------------
-# Environment Variables
-# -------------------------
-GLUE_JOBS = os.environ.get("GLUE_JOBS", "").split(",")
-APPFLOWS = os.environ.get("APPFLOWS", "").split(",")
-DMS_TASKS = os.environ.get("DMS_TASKS", "").split(",")
-BRONZE_BUCKET = os.environ.get("BRONZE_BUCKET")
-SILVER_BUCKET = os.environ.get("SILVER_BUCKET")
-GOLD_BUCKET = os.environ.get("GOLD_BUCKET")
-HUBSPOT_SECRET_ARN = os.environ.get("HUBSPOT_SECRET_ARN")
-BIGQUERY_SECRET_ARN = os.environ.get("BIGQUERY_SECRET_ARN")
-RDS_SECRET_ARN = os.environ.get("RDS_SECRET_ARN")
-BEDROCK_MODEL = os.environ.get("BEDROCK_MODEL", "amazon.titan-text")
-
-# -------------------------
-# Boto3 Clients
-# -------------------------
+# -------------------------------
+# AWS Clients
+# -------------------------------
+s3 = boto3.client("s3")
 glue = boto3.client("glue")
-appflow = boto3.client("appflow")
-dms = boto3.client("dms")
-secretsmanager = boto3.client("secretsmanager")
-bedrock = boto3.client("bedrock")
-qbusiness = boto3.client("qbusiness")
-cloudwatch = boto3.client("cloudwatch")
-sns = boto3.client("sns")  # optional for notifications
+databrew = boto3.client("databrew")
+athena = boto3.client("athena", region_name="us-east-1")
+bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1")
 
-# -------------------------
+# -------------------------------
+# ETL Config
+# -------------------------------
+BRONZE_BUCKET = "datalakenewai"
+BRONZE_PREFIX = "Bronze/"
+SILVER_BUCKET = "datalakenewai"
+SILVER_PREFIX = "Silver/"
+GOLD_BUCKET = "datalakenewai"
+GOLD_PREFIX = "Gold/"
+META_BUCKET = "datalakenewai"
+META_PREFIX = "meta-data/"
+
+BRONZE_CRAWLER = "bronze_crawler"
+SILVER_CRAWLER = "silver_crawler"
+GOLD_CRAWLER = "gold_crawler"
+
+BRONZE_TO_SILVER_JOB = "bronze-silver-etl-job"
+SILVER_TO_GOLD_JOB = "silver-gold"
+
+# -------------------------------
+# Athena / Bedrock Config
+# -------------------------------
+ATHENA_OUTPUT = "s3://datalakenewai/meta-data/athena-results/"
+GOLD_DB = "gold_db"
+TABLE_NAME = "gold"
+
+MODEL_ID = "amazon.nova-pro-v1:0"
+SYSTEM_PROMPT = """
+You are an analytics assistant. Only respond in JSON:
+{
+  "action": "chat" | "query",
+  "sql": "<Athena SQL query, optional>",
+  "reply": "<Human-readable response>"
+}
+"""
+TABLE_SCHEMA = """
+Table: gold
+Columns: brand, model, color, memory, storage, rating, selling_price, original_price, profit
+"""
+
+# -------------------------------
+# Few-Shot Examples (In-Memory)
+# -------------------------------
+examples = [
+    {"example_input_question": "What are the top 5 selling phones?", "brand": "Apple", "model": "iPhone 14", "profit": "100"},
+    {"example_input_question": "Which laptops have highest profit?", "brand": "Dell", "model": "XPS 13", "profit": "300"},
+    {"example_input_question": "Most profitable smartphones?", "brand": "Samsung", "model": "Galaxy S23", "profit": "150"},
+    {"example_input_question": "Top rated laptops?", "brand": "HP", "model": "Spectre x360", "profit": "300"}
+]
+
+# -------------------------------
+# Bedrock Embeddings
+# -------------------------------
+def get_embedding(text):
+    response = bedrock_client.invoke_model(
+        modelId="amazon.titan-embed-g1-text-02",
+        contentType="application/json",
+        body=json.dumps({"inputText": text})  # Correct Bedrock schema
+    )
+    result = json.loads(response["body"].read())
+    return result["embedding"]
+
+# Precompute embeddings
+example_vectors = [get_embedding(ex["example_input_question"]) for ex in examples]
+
+# -------------------------------
 # Helper Functions
-# -------------------------
+# -------------------------------
+def bronze_has_data():
+    resp = s3.list_objects_v2(Bucket=BRONZE_BUCKET, Prefix=BRONZE_PREFIX)
+    return resp.get("KeyCount", 0) > 0
 
-def get_secret(secret_arn):
-    """Fetch secret value from Secrets Manager"""
+def trigger_glue_crawler(crawler_name):
     try:
-        response = secretsmanager.get_secret_value(SecretId=secret_arn)
-        secret = response.get("SecretString")
-        return json.loads(secret)
-    except ClientError as e:
-        print(f"Error fetching secret {secret_arn}: {e}")
-        return None
-
-def trigger_appflow(flow_name):
-    """Start an AppFlow flow"""
-    try:
-        print(f"Starting AppFlow: {flow_name}")
-        appflow.start_flow(flowName=flow_name)
-    except ClientError as e:
-        print(f"Failed to start AppFlow {flow_name}: {e}")
-        return False
-    return True
-
-def trigger_dms(task_arn):
-    """Start DMS replication task"""
-    try:
-        print(f"Starting DMS task: {task_arn}")
-        dms.start_replication_task(
-            ReplicationTaskArn=task_arn,
-            StartReplicationTaskType='reload-target'
-        )
-    except ClientError as e:
-        print(f"Failed to start DMS task {task_arn}: {e}")
-        return False
-    return True
-
-def run_glue_job(job_name):
-    """Start Glue ETL job and wait until completion"""
-    try:
-        print(f"Starting Glue job: {job_name}")
-        response = glue.start_job_run(JobName=job_name)
-        job_run_id = response['JobRunId']
-        # Polling for job completion
-        while True:
-            status = glue.get_job_run(JobName=job_name, RunId=job_run_id)['JobRun']['JobRunState']
-            print(f"Glue job {job_name} status: {status}")
-            if status in ['SUCCEEDED', 'FAILED', 'STOPPED']:
-                break
-            time.sleep(30)
-        if status != 'SUCCEEDED':
-            print(f"Glue job {job_name} failed: {status}")
-            return False
-    except ClientError as e:
-        print(f"Failed to start Glue job {job_name}: {e}")
-        return False
-    return True
-
-def run_crawler(crawler_name):
-    """Run Glue crawler"""
-    try:
-        print(f"Starting crawler: {crawler_name}")
         glue.start_crawler(Name=crawler_name)
-    except ClientError as e:
-        print(f"Failed to start crawler {crawler_name}: {e}")
+        print(f"Triggered Glue Crawler: {crawler_name}")
+    except glue.exceptions.CrawlerRunningException:
+        print(f"Crawler '{crawler_name}' already running.")
 
-def fallback_q_check():
-    """Trigger Amazon Q fallback logic"""
+def run_databrew_job(job_name):
+    resp = databrew.start_job_run(Name=job_name)
+    run_id = resp["RunId"]
+    print(f"Started DataBrew Job: {job_name}, RunId: {run_id}")
+    return run_id
+
+def log_job_meta(job_name, run_id, status, table_name=None):
+    meta = {
+        "job_name": job_name,
+        "job_run_id": run_id,
+        "table_name": table_name or "NA",
+        "status": status,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    key = f"{META_PREFIX}logs/{job_name}_{run_id}_{table_name or 'NA'}.json"
+    s3.put_object(Bucket=META_BUCKET, Key=key, Body=json.dumps(meta))
+
+def cosine_sim(v1, v2):
+    dot = sum(a*b for a,b in zip(v1,v2))
+    norm1 = math.sqrt(sum(a*a for a in v1))
+    norm2 = math.sqrt(sum(b*b for b in v2))
+    return dot/(norm1*norm2) if norm1 and norm2 else 0
+
+def get_top_few_shot(user_question, top_k=2):
+    user_vec = get_embedding(user_question)
+    sims = [cosine_sim(user_vec, vec) for vec in example_vectors]
+    top_indices = sorted(range(len(sims)), key=lambda i: sims[i], reverse=True)[:top_k]
+    return [examples[i] for i in top_indices]
+
+# -------------------------------
+# Athena Query
+# -------------------------------
+def query_athena(sql_query):
+    resp = athena.start_query_execution(
+        QueryString=sql_query,
+        QueryExecutionContext={"Database": GOLD_DB},
+        ResultConfiguration={"OutputLocation": ATHENA_OUTPUT}
+    )
+    qid = resp["QueryExecutionId"]
+    while True:
+        status = athena.get_query_execution(QueryExecutionId=qid)["QueryExecution"]["Status"]["State"]
+        if status in ("SUCCEEDED", "FAILED", "CANCELLED"):
+            break
+        time.sleep(1)
+    if status != "SUCCEEDED":
+        return []
+    result = athena.get_query_results(QueryExecutionId=qid)
+    headers = [col["Label"] for col in result["ResultSet"]["ResultSetMetadata"]["ColumnInfo"]]
+    rows = []
+    for row in result["ResultSet"]["Rows"][1:]:
+        values = [cell.get("VarCharValue","") for cell in row["Data"]]
+        rows.append(dict(zip(headers, values)))
+    return rows
+
+def deduplicate_rows(rows):
+    seen = set()
+    deduped = []
+    for r in rows:
+        key = (r.get("brand"), r.get("model"), r.get("profit"))
+        if key not in seen:
+            deduped.append(r)
+            seen.add(key)
+    return deduped
+
+# -------------------------------
+# LLM SQL Generation
+# -------------------------------
+def ask_llm_generate_sql(user_question):
+    prompt = f"""
+{SYSTEM_PROMPT}
+
+Table schema:
+{TABLE_SCHEMA}
+
+Few-shot examples:
+{json.dumps(get_top_few_shot(user_question))}
+
+User question: {user_question}
+
+Output format:
+{{
+    "action": "query",
+    "sql": "<SQL query based on question>",
+    "reply": "<Optional human-readable text>"
+}}
+"""
     try:
-        print("Running Amazon Q fallback check")
-        response = qbusiness.ChatSync(
-            QueryText="Check ETL fallback status",
-            BotId="default",
-            SessionId=str(int(time.time()))
+        resp = bedrock_client.converse(
+            modelId=MODEL_ID,
+            messages=[{"role":"user","content":[{"text":prompt}]}],
+            inferenceConfig={"maxTokens":512,"temperature":0}
         )
-        print("Amazon Q fallback response:", response)
-    except ClientError as e:
-        print(f"Amazon Q fallback failed: {e}")
+        text = resp["output"]["message"]["content"][0]["text"]
+        try:
+            return json.loads(text)
+        except:
+            return {"action":"chat","sql":"","reply":text}
+    except Exception as e:
+        return {"action":"chat","sql":"","reply":f"Error calling LLM: {e}"}
 
-def invoke_bedrock(prompt_text):
-    """Invoke Bedrock model for insights"""
-    try:
-        print("Invoking Bedrock model...")
-        response = bedrock.invoke_model(
-            ModelId=BEDROCK_MODEL,
-            Body=json.dumps({"inputText": prompt_text}),
-            ContentType="application/json"
-        )
-        result = json.loads(response['Body'].read().decode())
-        print("Bedrock output:", result)
-    except ClientError as e:
-        print(f"Bedrock invocation failed: {e}")
+# -------------------------------
+# ETL Pipeline
+# -------------------------------
+def etl_pipeline_async():
+    if not bronze_has_data():
+        return {"reply":"No Bronze data to process."}
+    trigger_glue_crawler(BRONZE_CRAWLER)
+    run_id_silver = run_databrew_job(BRONZE_TO_SILVER_JOB)
+    log_job_meta(BRONZE_TO_SILVER_JOB, run_id_silver, "STARTED", "silver_table")
+    trigger_glue_crawler(SILVER_CRAWLER)
+    run_id_gold = run_databrew_job(SILVER_TO_GOLD_JOB)
+    log_job_meta(SILVER_TO_GOLD_JOB, run_id_gold, "STARTED", "gold_table")
+    trigger_glue_crawler(GOLD_CRAWLER)
+    log_job_meta(GOLD_CRAWLER, "NA", "STARTED")
+    return {"reply":"ETL triggered asynchronously.","run_ids":{"silver":run_id_silver,"gold":run_id_gold}}
 
-# -------------------------
-# Lambda Handler
-# -------------------------
-def handler(event, context):
-    print("Starting Strands orchestration pipeline...")
 
-    # Fetch secrets
-    hubspot_creds = get_secret(HUBSPOT_SECRET_ARN)
-    bigquery_creds = get_secret(BIGQUERY_SECRET_ARN)
-    rds_creds = get_secret(RDS_SECRET_ARN)
-
-    if not hubspot_creds or not bigquery_creds or not rds_creds:
-        print("One or more secrets not available, triggering fallback.")
-        fallback_q_check()
-        return {"status": "failed", "reason": "Missing credentials"}
-
-    # Step 1: Trigger AppFlow flows
-    for flow in APPFLOWS:
-        if not trigger_appflow(flow):
-            fallback_q_check()
-
-    # Step 2: Trigger DMS tasks
-    for task in DMS_TASKS:
-        if not trigger_dms(task):
-            fallback_q_check()
-
-    # Step 3: Run Glue jobs
-    for job in GLUE_JOBS:
-        if not run_glue_job(job):
-            fallback_q_check()
-
-    # Step 4: Run Glue crawlers for schema update
-    for crawler in ["bronze-crawler", "silver-crawler", "gold-crawler"]:
-        run_crawler(f"{crawler}-{os.environ.get('Environment', 'dev')}")
-
-    # Step 5: Invoke Bedrock chatbot for insights
-    invoke_bedrock("Generate summary of curated gold layer data")
-
-    print("Pipeline completed successfully")
-    return {"status": "success"}
