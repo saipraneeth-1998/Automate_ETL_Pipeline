@@ -208,4 +208,40 @@ def etl_pipeline_async():
     log_job_meta(GOLD_CRAWLER, "NA", "STARTED")
     return {"reply":"ETL triggered asynchronously.","run_ids":{"silver":run_id_silver,"gold":run_id_gold}}
 
+def lambda_handler(event, context):
+    """
+    event = {
+        "action": "etl" | "query",
+        "user_message": "string"
+    }
+    """
+    action = event.get("action")
+    user_message = event.get("user_message", "")
+
+    if action == "etl":
+        return {
+            "statusCode": 200,
+            "body": json.dumps(etl_pipeline_async())
+        }
+
+    elif action == "query" and user_message:
+        llm_output = ask_llm_generate_sql(user_message)
+        sql_query = llm_output.get("sql")
+        reply = llm_output.get("reply", "")
+
+        data = []
+        if llm_output.get("action") == "query" and sql_query:
+            data = deduplicate_rows(query_athena(sql_query))
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"reply": reply, "data": data})
+        }
+
+    else:
+        return {
+            "statusCode": 400,
+            "body": json.dumps({"reply": "Invalid action or missing user_message"})
+        }
+
 
