@@ -4,6 +4,74 @@
 
 Managing large-scale ETL pipelines manually is time-consuming, error-prone, and often lacks real-time insights. SmartETL automates the movement, transformation, and analysis of data while optionally allowing business users to query results using natural language.
 
+
+**SmartETL – AI-Driven ETL Pipeline Architecture**
+            ┌─────────────┐
+            │   Raw Data  │
+            │ (CSV, JSON)│
+            └─────┬──────┘
+                  │ Upload
+                  ▼
+           ┌─────────────┐
+           │   S3 Bucket │
+           │   Bronze    │
+           └─────┬──────┘
+                 │ Trigger Event
+                 ▼
+        ┌───────────────────┐
+        │  AWS Lambda       │
+        │ (Orchestrator)    │
+        └─────┬─────────────┘
+              │ Triggers
+              ▼
+       ┌──────────────┐
+       │ AWS DataBrew │
+       │ (Bronze→Silver) │
+       └─────┬─────────┘
+             │ Stores Cleaned Data
+             ▼
+        ┌─────────────┐
+        │   S3 Bucket │
+        │   Silver    │
+        └─────┬───────┘
+             │ Trigger Crawler
+             ▼
+       ┌─────────────┐
+       │ AWS Glue    │
+       │ (Catalog    │
+       │ Crawlers)   │
+       └─────┬───────┘
+             │ Trigger
+             ▼
+       ┌──────────────┐
+       │ AWS DataBrew │
+       │ (Silver→Gold)│
+       └─────┬────────┘
+             │ Stores Analytics-Ready Data
+             ▼
+        ┌─────────────┐
+        │   S3 Bucket │
+        │   Gold      │
+        └─────┬───────┘
+             │ Catalog Updates
+             ▼
+        ┌─────────────┐
+        │  AWS Glue   │
+        │ (Gold DB)   │
+        └─────┬───────┘
+             │ Query
+             ▼
+        ┌─────────────┐
+        │  AWS Athena │
+        │ (SQL Queries)│
+        └─────┬───────┘
+             │ Results
+             ▼
+   ┌─────────────────────┐
+   │ API / Streamlit /   │
+   │ Lambda + LLM Query  │
+   └─────────────────────┘
+
 ---
 ## Data Schema
 ColumnName   Data Type	Description
