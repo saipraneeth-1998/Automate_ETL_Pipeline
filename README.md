@@ -5,7 +5,19 @@
 Managing large-scale ETL pipelines manually is time-consuming, error-prone, and often lacks real-time insights. SmartETL automates the movement, transformation, and analysis of data while optionally allowing business users to query results using natural language.
 
 ---
+## Data Schema
+ColumnName   Data Type	Description
+brand	     STRING	      Brand of the smartphone (e.g., APPLE, GOOGLE PIXEL)
+model	     STRING	      Model of the smartphone (e.g., IPHONE 13, 3 XL)
+color	     STRING	      Color variant of the smartphone (e.g., GREEN, JUST BLACK)
+memory	     STRING	      RAM size (e.g., 4 GB, 8 GB)
+storage	     STRING	      Internal storage capacity (e.g., 128 GB, 512 GB)
+original_price	STRING or FLOAT	   Manufacturer/retail price of the smartphone
+selling_price	STRING or FLOAT	   Actual selling price
+profit	   STRING or FLOAT	Profit calculated as selling_price - original_price
+rating	   STRING or FLOAT	Customer rating (scale 1–5)
 
+---
 ## Inspiration
 Data teams spend a lot of time on repetitive ETL tasks like cleaning, transforming, and aggregating data. SmartETL was created to:
 
@@ -98,3 +110,18 @@ Place files into:
     "action": "query",
     "user_message": "top sellers"
 }
+
+**Questions to test:**
+- Can you query all products with rating > 4.5?
+
+- Can you query top N products by profit or selling_price?
+
+- Can you get aggregated insights per brand, such as:
+
+- Total revenue per brand
+
+- Average profit per brand
+
+- Average rating per brand
+
+- Can you filter products by memory and storage (e.g., "8 GB RAM and 256 GB storage")?
