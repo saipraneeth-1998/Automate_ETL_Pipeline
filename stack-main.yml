@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Data lake pipeline infra: S3 buckets, Glue DB, Glue Crawler, IAM roles, AppFlow & DMS skeleton"
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  KmsKeyArn:
+    Type: String
+    Description: "KMS Key ARN for S3 encryption"
+  #HubSpotSecretArn:
+   # Type: String
+   # Description: "Secrets Manager ARN with HubSpot OAuth credentials"
+  #BigQuerySecretArn:
+   # Type: String
+    #Description: "Secrets Manager ARN with BigQuery service account json"
+  RdsSecretArn:
+    Type: String
+    Description: "Secrets Manager ARN with RDS credentials"
+  RdsEndpoint:
+    Type: String
+    Description: "RDS endpoint (host)"
+  RdsDbName:
+    Type: String
+    Default: mydb
+
+Resources:
+
+  BronzeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${Environment}-datalake-bronze"
+      VersioningConfiguration: { Status: Enabled }
+      LifecycleConfiguration:
+        Rules:
+          - Id: "bronze-to-infrequent"
+            Status: Enabled
+            Prefix: ""
+            Transitions:
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 365
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref KmsKeyArn
+              SSEAlgorithm: aws:kms
+
+  SilverBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${Environment}-datalake-silver"
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref KmsKeyArn
+              SSEAlgorithm: aws:kms
+
+  GoldBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${Environment}-datalake-gold"
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref KmsKeyArn
+              SSEAlgorithm: aws:kms
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "glue-service-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: glue.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueCustom
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub "arn:aws:s3:::${AWS::AccountId}-${Environment}-datalake-bronze"
+                  - !Sub "arn:aws:s3:::${AWS::AccountId}-${Environment}-datalake-bronze/*"
+                  - !Sub "arn:aws:s3:::${AWS::AccountId}-${Environment}-datalake-silver"
+                  - !Sub "arn:aws:s3:::${AWS::AccountId}-${Environment}-datalake-silver/*"
+                  - !Sub "arn:aws:s3:::${AWS::AccountId}-${Environment}-datalake-gold"
+                  - !Sub "arn:aws:s3:::${AWS::AccountId}-${Environment}-datalake-gold/*"
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "datalake_${Environment}"
+        Description: "Glue catalog DB for ${Environment}"
+
+  BronzeCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "bronze-crawler-${Environment}"
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${AWS::AccountId}-${Environment}-datalake-bronze/"
+      Schedule: "cron(0 */6 * * ? *)" # run every 6 hours
+      TablePrefix: bronze_
+
+  # AppFlow Flow for HubSpot (skeleton)
+  HubSpotFlow:
+    Type: AWS::AppFlow::Flow
+    Properties:
+      FlowName: !Sub "hubspot-to-s3-${Environment}"
+      SourceFlowConfig:
+        ConnectorType: HubSpot
+        ConnectorProfileName: !Sub "hubspot-profile-${Environment}"
+        # Additional configuration is often required at runtime (fields, incremental settings)
+      DestinationFlowConfigList:
+        - ConnectorType: S3
+          DestinationConnectorProperties:
+            S3:
+              BucketName: !Ref BronzeBucket
+              BucketPrefix: "hubspot/"
+      # TriggerConfig can be ON_DEMAND or scheduled
+      TriggerConfig:
+        TriggerType: Scheduled
+        TriggerProperties:
+          Scheduled:
+            ScheduleExpression: "rate(1 hour)"
+
+  # AppFlow Flow for BigQuery (skeleton)
+  BigQueryFlow:
+    Type: AWS::AppFlow::Flow
+    Properties:
+      FlowName: !Sub "bigquery-to-s3-${Environment}"
+      SourceFlowConfig:
+        ConnectorType: GoogleBigQuery
+        ConnectorProfileName: !Sub "bigquery-profile-${Environment}"
+      DestinationFlowConfigList:
+        - ConnectorType: S3
+          DestinationConnectorProperties:
+            S3:
+              BucketName: !Ref BronzeBucket
+              BucketPrefix: "bigquery/"
+      TriggerConfig:
+        TriggerType: Scheduled
+        TriggerProperties:
+          Scheduled:
+            ScheduleExpression: "rate(1 hour)"
+
+  # DMS Replication Instance (skeleton)
+  DmsReplicationInstance:
+    Type: AWS::DMS::ReplicationInstance
+    Properties:
+      ReplicationInstanceClass: dms.r5.large
+      AllocatedStorage: 100
+      ReplicationInstanceIdentifier: !Sub "dms-repl-${Environment}"
+      PubliclyAccessible: false
+
+  DmsS3Endpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub "dms-s3-endpoint-${Environment}"
+      EndpointType: target
+      EngineName: s3
+      S3Settings:
+        BucketName: !Ref BronzeBucket
+        BucketFolder: rds
+        ServiceAccessRoleArn: !GetAtt DmsAccessRole.Arn
+
+  DmsAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "dms-access-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: dms.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+  # DMS Source Endpoint for RDS (we'll use secrets externally)
+  DmsRdsEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub "dms-rds-endpoint-${Environment}"
+      EndpointType: source
+      EngineName: postgres
+      # Connection attributes (server name, port, dbname) set here:
+      ServerName: !Ref RdsEndpoint
+      Port: 5432
+      DatabaseName: !Ref RdsDbName
+      ExtraConnectionAttributes: ""
+      # Credentials must be supplied when creating a task (or use secrets manager direct reference)
+
+Outputs:
+  BronzeBucketName:
+    Value: !Ref BronzeBucket
+  SilverBucketName:
+    Value: !Ref SilverBucket
+  GoldBucketName:
+    Value: !Ref GoldBucket
+  GlueDatabaseName:
+    Value: !GetAtt GlueDatabase.DatabaseInput.Name

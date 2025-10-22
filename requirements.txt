@@ -1,0 +1,16 @@
+boto3
+strands-agents
+asyncio
+aws
+google-cloud-bigquery
+pandas
+numpy
+PyYAML
+python-dotenv
+loguru
+requests
+awscli
+typing-extensions
+jsonschema
+streamlit
+requests
