@@ -101,7 +101,7 @@ Place files into:
 - Assign IAM role  
 - Increase timeout (15+ min) & memory (3GB)
 
-  **Questions to test:**
+**Questions to test:**
   
 - Can you query all products with rating > 4.5?
 
