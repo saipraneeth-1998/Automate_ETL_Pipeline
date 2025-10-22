@@ -1,7 +1,8 @@
-import boto3
-import time
 import json
+import boto3
 from datetime import datetime
+import time
+import math
 
 # -------------------------------
 # AWS Clients
@@ -9,147 +10,124 @@ from datetime import datetime
 s3 = boto3.client("s3")
 glue = boto3.client("glue")
 databrew = boto3.client("databrew")
-athena = boto3.client("athena")
-bedrock = boto3.client("bedrock-runtime")  # LLM client
+athena = boto3.client("athena", region_name="us-east-1")
+bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1")
 
 # -------------------------------
-# Configuration
+# ETL Config
 # -------------------------------
 BRONZE_BUCKET = "datalakenewai"
 BRONZE_PREFIX = "Bronze/"
-
-SILVER_DB = "silver_db"
-GOLD_DB = "gold_db"
-
+SILVER_BUCKET = "datalakenewai"
+SILVER_PREFIX = "Silver/"
 GOLD_BUCKET = "datalakenewai"
 GOLD_PREFIX = "Gold/"
-
 META_BUCKET = "datalakenewai"
 META_PREFIX = "meta-data/"
 
-ATHENA_OUTPUT = "s3://datalakenewai/meta-data/athena-results/"
-
-
-# Crawlers
 BRONZE_CRAWLER = "bronze_crawler"
-SILVER_CRAWLER = "silver-crawler"
+SILVER_CRAWLER = "silver_crawler"
 GOLD_CRAWLER = "gold_crawler"
 
-# DataBrew Jobs
 BRONZE_TO_SILVER_JOB = "bronze-silver-etl-job"
 SILVER_TO_GOLD_JOB = "silver-gold"
 
 # -------------------------------
-# System Prompt for LLM
+# Athena / Bedrock Config
 # -------------------------------
-SYSTEM_PROMPT = """
-You are a highly skilled Business Analyst with expertise in data analytics, sales, customer behavior, and e-commerce metrics. 
-Your task is to interpret user requests, generate insights from the provided data (Athena tables or other sources), and respond in a clear, professional, and actionable manner.
+ATHENA_OUTPUT = "s3://datalakenewai/meta-data/athena-results/"
+GOLD_DB = "gold_db"
+TABLE_NAME = "gold"
 
-Guidelines:
-1. Determine if the request needs ETL, Athena query, or insight explanation.
-2. Provide actionable insights in plain business language.
-3. Translate questions into Athena-compatible SQL if needed.
-4. Ask clarifying questions if the data source is unclear.
-5. Summarize insights in 1-3 sentences.
+MODEL_ID = "amazon.nova-pro-v1:0"
+SYSTEM_PROMPT = """
+You are an analytics assistant. Only respond in JSON:
+{
+  "action": "chat" | "query",
+  "sql": "<Athena SQL query, optional>",
+  "reply": "<Human-readable response>"
+}
 """
+TABLE_SCHEMA = """
+Table: gold
+Columns: brand, model, color, memory, storage, rating, selling_price, original_price, profit
+"""
+
+# -------------------------------
+# Few-Shot Examples (In-Memory)
+# -------------------------------
+examples = [
+    {"example_input_question": "What are the top 5 selling phones?", "brand": "Apple", "model": "iPhone 14", "profit": "100"},
+    {"example_input_question": "Which laptops have highest profit?", "brand": "Dell", "model": "XPS 13", "profit": "300"},
+    {"example_input_question": "Most profitable smartphones?", "brand": "Samsung", "model": "Galaxy S23", "profit": "150"},
+    {"example_input_question": "Top rated laptops?", "brand": "HP", "model": "Spectre x360", "profit": "300"}
+]
+
+# -------------------------------
+# Bedrock Embeddings
+# -------------------------------
+def get_embedding(text):
+    response = bedrock_client.invoke_model(
+        modelId="amazon.titan-embed-g1-text-02",
+        contentType="application/json",
+        body=json.dumps({"inputText": text})  # Correct Bedrock schema
+    )
+    result = json.loads(response["body"].read())
+    return result["embedding"]
+
+# Precompute embeddings
+example_vectors = [get_embedding(ex["example_input_question"]) for ex in examples]
 
 # -------------------------------
 # Helper Functions
 # -------------------------------
 def bronze_has_data():
     resp = s3.list_objects_v2(Bucket=BRONZE_BUCKET, Prefix=BRONZE_PREFIX)
-    count = resp.get("KeyCount", 0)
-    print(f"Found {count} files in Bronze layer.")
-    return count > 0
+    return resp.get("KeyCount", 0) > 0
 
 def trigger_glue_crawler(crawler_name):
-    glue.start_crawler(Name=crawler_name)
-    print(f"Crawler {crawler_name} triggered.")
-    while True:
-        status = glue.get_crawler(Name=crawler_name)["Crawler"]["State"]
-        if status == "READY":
-            break
-        print(f"Waiting for crawler {crawler_name} to finish...")
-        time.sleep(5)
-    print(f"Crawler {crawler_name} finished.")
+    try:
+        glue.start_crawler(Name=crawler_name)
+        print(f"Triggered Glue Crawler: {crawler_name}")
+    except glue.exceptions.CrawlerRunningException:
+        print(f"Crawler '{crawler_name}' already running.")
 
 def run_databrew_job(job_name):
     resp = databrew.start_job_run(Name=job_name)
     run_id = resp["RunId"]
-    print(f"DataBrew Job {job_name} started with RunId: {run_id}")
+    print(f"Started DataBrew Job: {job_name}, RunId: {run_id}")
     return run_id
-
-def wait_for_databrew_job(job_name, run_id):
-    while True:
-        resp = databrew.describe_job_run(Name=job_name, RunId=run_id)
-        status = resp.get("State")
-        if status in ("SUCCEEDED", "FAILED", "CANCELLED"):
-            print(f"DataBrew Job {job_name} completed with status: {status}")
-            return status
-        print(f"Waiting for DataBrew job {job_name} to finish...")
-        time.sleep(10)
 
 def log_job_meta(job_name, run_id, status, table_name=None):
     meta = {
         "job_name": job_name,
         "job_run_id": run_id,
-        "table_name": table_name,
+        "table_name": table_name or "NA",
         "status": status,
         "timestamp": datetime.utcnow().isoformat()
     }
     key = f"{META_PREFIX}logs/{job_name}_{run_id}_{table_name or 'NA'}.json"
     s3.put_object(Bucket=META_BUCKET, Key=key, Body=json.dumps(meta))
-    print(f"Logged metadata to {META_BUCKET}/{key}")
 
-def list_silver_tables():
-    tables_resp = glue.get_tables(DatabaseName=SILVER_DB)
-    tables = [t['Name'] for t in tables_resp['TableList']]
-    print(f"Silver tables: {tables}")
-    return tables
+def cosine_sim(v1, v2):
+    dot = sum(a*b for a,b in zip(v1,v2))
+    norm1 = math.sqrt(sum(a*a for a in v1))
+    norm2 = math.sqrt(sum(b*b for b in v2))
+    return dot/(norm1*norm2) if norm1 and norm2 else 0
 
-# -------------------------------
-# ETL Pipeline
-# -------------------------------
-def etl_pipeline_databrew():
-    if not bronze_has_data():
-        return "No Bronze data to process."
-
-    print("Triggering Bronze crawler...")
-    trigger_glue_crawler(BRONZE_CRAWLER)
-
-    print("Running Bronze → Silver DataBrew job...")
-    run_id_silver = run_databrew_job(BRONZE_TO_SILVER_JOB)
-    status_silver = wait_for_databrew_job(BRONZE_TO_SILVER_JOB, run_id_silver)
-    log_job_meta(BRONZE_TO_SILVER_JOB, run_id_silver, status_silver)
-    if status_silver != "SUCCEEDED":
-        return "Silver ETL failed."
-
-    print("Triggering Silver crawler...")
-    trigger_glue_crawler(SILVER_CRAWLER)
-
-    silver_tables = list_silver_tables()
-    if not silver_tables:
-        return "No Silver tables found."
-
-    for table in silver_tables:
-        print(f"Running Silver → Gold DataBrew job for {table}")
-        run_id_gold = run_databrew_job(SILVER_TO_GOLD_JOB)
-        status_gold = wait_for_databrew_job(SILVER_TO_GOLD_JOB, run_id_gold)
-        log_job_meta(SILVER_TO_GOLD_JOB, run_id_gold, status_gold, table_name=table)
-
-    print("Triggering Gold crawler...")
-    trigger_glue_crawler(GOLD_CRAWLER)
-
-    return "ETL pipeline completed successfully."
+def get_top_few_shot(user_question, top_k=2):
+    user_vec = get_embedding(user_question)
+    sims = [cosine_sim(user_vec, vec) for vec in example_vectors]
+    top_indices = sorted(range(len(sims)), key=lambda i: sims[i], reverse=True)[:top_k]
+    return [examples[i] for i in top_indices]
 
 # -------------------------------
-# Athena Queries
+# Athena Query
 # -------------------------------
-def query_athena(sql_query, database=GOLD_DB):
+def query_athena(sql_query):
     resp = athena.start_query_execution(
         QueryString=sql_query,
-        QueryExecutionContext={"Database": database},
+        QueryExecutionContext={"Database": GOLD_DB},
         ResultConfiguration={"OutputLocation": ATHENA_OUTPUT}
     )
     qid = resp["QueryExecutionId"]
@@ -157,59 +135,77 @@ def query_athena(sql_query, database=GOLD_DB):
         status = athena.get_query_execution(QueryExecutionId=qid)["QueryExecution"]["Status"]["State"]
         if status in ("SUCCEEDED", "FAILED", "CANCELLED"):
             break
-        time.sleep(2)
-
+        time.sleep(1)
     if status != "SUCCEEDED":
-        return {"error": status}
-
-    results = athena.get_query_results(QueryExecutionId=qid)
-    header = [col["Label"] for col in results["ResultSet"]["ResultSetMetadata"]["ColumnInfo"]]
+        return []
+    result = athena.get_query_results(QueryExecutionId=qid)
+    headers = [col["Label"] for col in result["ResultSet"]["ResultSetMetadata"]["ColumnInfo"]]
     rows = []
-    for row in results["ResultSet"]["Rows"][1:]:
-        rows.append({header[i]: row["Data"][i].get("VarCharValue", "") for i in range(len(header))})
+    for row in result["ResultSet"]["Rows"][1:]:
+        values = [cell.get("VarCharValue","") for cell in row["Data"]]
+        rows.append(dict(zip(headers, values)))
     return rows
 
-# -------------------------------
-# LLM Integration
-# -------------------------------
-def ask_llm(user_message):
-    prompt = f"{SYSTEM_PROMPT}\nUser: {user_message}\nResponse:"
-    response = bedrock.invoke_model(
-        ModelId="amazon.nova-pro-v1:0",  # example LLM, replace with your model
-        Body=json.dumps({
-            "inputText": prompt,
-            "maxTokensToSample": 500
-        }),
-        ContentType="application/json"
-    )
-    output = json.loads(response['Body'].read())['completion']
-    return output
+def deduplicate_rows(rows):
+    seen = set()
+    deduped = []
+    for r in rows:
+        key = (r.get("brand"), r.get("model"), r.get("profit"))
+        if key not in seen:
+            deduped.append(r)
+            seen.add(key)
+    return deduped
 
 # -------------------------------
-# User Request Processor
+# LLM SQL Generation
 # -------------------------------
-def process_user_request(message):
-    message_lower = message.lower()
-    if "run etl" in message_lower or "start pipeline" in message_lower:
-        return etl_pipeline_databrew()
-    elif "top customers" in message_lower or "sales" in message_lower:
-        # For any data-driven question, query Athena first
-        sql = f"SELECT * FROM top_customers LIMIT 5"  # Replace with dynamic SQL if needed
-        results = query_athena(sql)
-        return results
-    elif "show tables" in message_lower:
-        return {"silver_tables": list_silver_tables()}
-    else:
-        # Otherwise, forward to LLM for analysis/insight
-        return ask_llm(message)
+def ask_llm_generate_sql(user_question):
+    prompt = f"""
+{SYSTEM_PROMPT}
+
+Table schema:
+{TABLE_SCHEMA}
+
+Few-shot examples:
+{json.dumps(get_top_few_shot(user_question))}
+
+User question: {user_question}
+
+Output format:
+{{
+    "action": "query",
+    "sql": "<SQL query based on question>",
+    "reply": "<Optional human-readable text>"
+}}
+"""
+    try:
+        resp = bedrock_client.converse(
+            modelId=MODEL_ID,
+            messages=[{"role":"user","content":[{"text":prompt}]}],
+            inferenceConfig={"maxTokens":512,"temperature":0}
+        )
+        text = resp["output"]["message"]["content"][0]["text"]
+        try:
+            return json.loads(text)
+        except:
+            return {"action":"chat","sql":"","reply":text}
+    except Exception as e:
+        return {"action":"chat","sql":"","reply":f"Error calling LLM: {e}"}
 
 # -------------------------------
-# Lambda Handler Example
+# ETL Pipeline
 # -------------------------------
-def lambda_handler(event, context):
-    user_message = event.get("message", "Show me top customers")
-    response = process_user_request(user_message)
-    return {
-        "statusCode": 200,
-        "body": json.dumps(response)
-    }
+def etl_pipeline_async():
+    if not bronze_has_data():
+        return {"reply":"No Bronze data to process."}
+    trigger_glue_crawler(BRONZE_CRAWLER)
+    run_id_silver = run_databrew_job(BRONZE_TO_SILVER_JOB)
+    log_job_meta(BRONZE_TO_SILVER_JOB, run_id_silver, "STARTED", "silver_table")
+    trigger_glue_crawler(SILVER_CRAWLER)
+    run_id_gold = run_databrew_job(SILVER_TO_GOLD_JOB)
+    log_job_meta(SILVER_TO_GOLD_JOB, run_id_gold, "STARTED", "gold_table")
+    trigger_glue_crawler(GOLD_CRAWLER)
+    log_job_meta(GOLD_CRAWLER, "NA", "STARTED")
+    return {"reply":"ETL triggered asynchronously.","run_ids":{"silver":run_id_silver,"gold":run_id_gold}}
+
+
