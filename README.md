@@ -99,19 +99,10 @@ Place files into:
 #### 4. Deploy Lambda Function
 - Paste SmartETL Lambda code  
 - Assign IAM role  
-- Increase timeout (15+ min) & memory (3GB)  
+- Increase timeout (15+ min) & memory (3GB)
 
-**Test Event Example:**
-```json
-{
-    "action": "etl"
-}
-{
-    "action": "query",
-    "user_message": "top sellers"
-}
-
-**Questions to test:**
+  **Questions to test:**
+  
 - Can you query all products with rating > 4.5?
 
 - Can you query top N products by profit or selling_price?
@@ -125,3 +116,15 @@ Place files into:
 - Average rating per brand
 
 - Can you filter products by memory and storage (e.g., "8 GB RAM and 256 GB storage")?
+
+
+**Test Event Example:**
+```json
+{
+    "action": "etl"
+}
+{
+    "action": "query",
+    "user_message": "top sellers"
+}
+
