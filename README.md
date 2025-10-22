@@ -87,5 +87,8 @@ SmartETL automates the following workflow:
    - Test event example:
    ```json
    {
-     "message": "run etl"
+     "action": "run etl"
    }
+{
+"query" : "top selles "
+}
