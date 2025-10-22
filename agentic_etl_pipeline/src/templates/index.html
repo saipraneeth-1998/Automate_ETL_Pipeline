@@ -1,0 +1,47 @@
+<!-- index.html -->
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+...
+<button id="etl-btn">Start ETL</button>
+<pre id="etl-result"></pre>
+...
+<input type="text" id="user-message" placeholder="Enter your query">
+<button id="query-btn">Run Query</button>
+<div id="query-reply" class="reply"></div>
+<table id="query-table">...</table>
+<script>
+    document.getElementById("etl-btn").addEventListener("click", async () => {
+        const res = await fetch("/api/etl", { method: "POST" });
+        const data = await res.json();
+        document.getElementById("etl-result").textContent = JSON.stringify(data, null, 4);
+    });
+
+    document.getElementById("query-btn").addEventListener("click", async () => {
+        const userMessage = document.getElementById("user-message").value;
+        const res = await fetch("/api/query", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ user_message: userMessage })
+        });
+        const data = await res.json();
+        document.getElementById("query-reply").textContent = data.reply || "";
+        const tbody = document.querySelector("#query-table tbody");
+        tbody.innerHTML = "";
+        if (data.data && data.data.length > 0) {
+            data.data.forEach(item => {
+                const row = document.createElement("tr");
+                row.innerHTML = `
+                    <td>${item.brand}</td>
+                    <td>${item.model}</td>
+                    <td>${item.color}</td>
+                    <td>${item.memory}</td>
+                    <td>${item.storage}</td>
+                    <td>${item.original_price}</td>
+                    <td>${item.selling_price}</td>
+                    <td>${item.profit}</td>
+                    <td>${item.rating}</td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+    });
+</script>
